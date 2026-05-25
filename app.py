@@ -1,213 +1,140 @@
-import streamlit as st
-import sqlite3
+from ursina import *
+from ursina.prefabs.first_person_controller import FirstPersonController
 import random
 
-# --- DATABASE SETUP ---
-DB_FILE = "driving_game.db"
+app = Ursina()
 
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS players (
-            username TEXT PRIMARY KEY,
-            money REAL,
-            miles_driven REAL
+# --- WINDOW SETUP ---
+window.title = "Ultimate 3D Driving Simulator"
+window.fps_counter.enabled = True
+window.exit_button.visible = False
+
+# --- GAME VARIABLES ---
+current_vehicle_idx = 0
+vehicles_data = [
+    {"name": "Car", "color": color.red, "scale": (1.5, 1, 2.5), "speed": 25},
+    {"name": "Jeep", "color": color.orange, "scale": (1.8, 1.5, 2.8), "speed": 20},
+    {"name": "Truck", "color": color.blue, "scale": (2.2, 2.5, 5), "speed": 12},
+    {"name": "Boat", "color": color.cyan, "scale": (1.6, 1.2, 3), "speed": 18}
+]
+
+money = 100
+current_track = "Highway"
+
+# --- 3D ENVIRONMENT CREATION ---
+# Sky
+Sky()
+
+# Ground / Track
+ground = Entity(model='plane', scale=(500, 1, 500), texture='grass', collider='box')
+
+# Simple 3D Hills (Obstacles)
+hills = []
+def generate_hills():
+    global hills
+    for h in hills:
+        destroy(h)
+    hills.clear()
+    
+    # Generate some random 3D blocks representing terrain/hills
+    for _ in range(40):
+        h = Entity(
+            model='cube', 
+            position=(random.uniform(-100, 100), 2, random.uniform(-100, 100)),
+            scale=(random.uniform(5, 15), random.uniform(2, 10), random.uniform(5, 15)),
+            color=color.dark_grey,
+            collider='box'
         )
-    ''')
-    conn.commit()
-    conn.close()
+        hills.append(h)
 
-def get_player(username):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT money, miles_driven FROM players WHERE username = ?", (username,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return {"money": row[0], "miles": row[1]}
-    return None
+generate_hills()
 
-def save_player(username, money, miles):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''
-        INSERT INTO players (username, money, miles_driven)
-        VALUES (?, ?, ?)
-        ON CONFLICT(username) DO UPDATE SET
-            money = excluded.money,
-            miles_driven = excluded.miles_driven
-    ''', (username, money, miles))
-    conn.commit()
-    conn.close()
+# --- THE VEHICLE ENTITY ---
+v_meta = vehicles_data[current_vehicle_idx]
+player_vehicle = Entity(
+    model='cube', 
+    color=v_meta["color"], 
+    scale=v_meta["scale"], 
+    position=(0, 1, 0), 
+    collider='box'
+)
 
-# Initialize Database
-init_db()
+# Attach Camera smoothly behind the vehicle
+camera.parent = player_vehicle
+camera.position = (0, 5, -10)
+camera.rotation_x = 20
 
-# --- STREAMLIT PAGE SETUP ---
-st.set_page_config(page_title="Multiverse Driving Simulator", page_icon="🚗", layout="centered")
-st.title("🚗 Multiverse Driving Simulator 🌊")
-st.write("Manage your speed, gears, and steering to survive the tracks and earn cash.")
+# --- SCREEN UI DISPLAY ---
+ui_text = Text(
+    text=f'Vehicle: {v_meta["name"]} | Track: {current_track} | Money: ${money}\nControls: WASD/Arrows to Drive | SPACE to Brake | V to Change Vehicle | T to Change Terrain',
+    position=(-0.7, 0.45),
+    scale=1.5,
+    color=color.yellow
+)
 
-# --- GAME STATE MANAGEMENT ---
-if "player_name" not in st.session_state:
-    st.session_state.player_name = ""
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-if "game_active" not in st.session_state:
-    st.session_state.game_active = False
-
-# --- LOGIN / PROFILE SECTION ---
-if not st.session_state.logged_in:
-    st.subheader("Profile Login")
-    name_input = st.text_input("Enter Driver Profile Name:", max_chars=15).strip()
-    if st.button("Load / Create Profile"):
-        if name_input:
-            st.session_state.player_name = name_input
-            st.session_state.logged_in = True
-            
-            data = get_player(name_input)
-            if data:
-                st.session_state.money = data["money"]
-                st.session_state.miles = data["miles"]
-                st.success(f"Welcome back, Driver {name_input}!")
-            else:
-                st.session_state.money = 100.0  # Starting cash
-                st.session_state.miles = 0.0
-                save_player(name_input, st.session_state.money, st.session_state.miles)
-                st.info(f"Created a new profile for {name_input}!")
-            st.rerun()
-        else:
-            st.error("Please enter a valid profile name.")
-    st.stop()
-
-# Display Persistent Dashboard
-st.sidebar.markdown(f"### 👤 Driver: **{st.session_state.player_name}**")
-st.sidebar.metric("Balance", f"${st.session_state.money:.2f}")
-st.sidebar.metric("Career Distance", f"{st.session_state.miles:.1f} miles")
-if st.sidebar.button("Log Out"):
-    st.session_state.logged_in = False
-    st.rerun()
-
-# --- SETUP NEW MISSION ---
-if not st.session_state.game_active:
-    st.subheader("🏁 Configure Your Next Trip")
+# --- GAME ENGINE LOOP (Runs 60+ FPS) ---
+speed = 0
+def update():
+    global speed, current_track, money
+    v_meta = vehicles_data[current_vehicle_idx]
     
-    col1, col2 = st.columns(2)
-    with col1:
-        vehicle = st.selectbox("Select Your Ride:", ["Sedan Car", "4x4 Jeep", "Heavy Truck", "Speed Boat"])
-        track = st.selectbox("Select Terrain:", ["Open Highway", "Rocky Hill Tracks", "Deep Water Route"])
-    with col2:
-        difficulty = st.radio("Risk Level:", ["Easy (Safe pacing)", "Risky (High hazard, 2x reward)"])
+    # 1. Steering & Driving Physics Mechanics
+    max_speed = v_meta["speed"]
+    
+    # Acceleration / Forward
+    if held_keys['w'] or held_keys['up arrow']:
+        speed = min(speed + 20 * time.dt, max_speed)
+    # Reverse / Brake
+    elif held_keys['s'] or held_keys['down arrow']:
+        speed = max(speed - 20 * time.dt, -max_speed/2)
+    # Natural Friction deceleration
+    else:
+        if speed > 0: speed = max(0, speed - 10 * time.dt)
+        if speed < 0: speed = min(0, speed + 10 * time.dt)
         
-    if st.button("Start Engine 🔑"):
-        # Basic validation rule
-        if vehicle == "Speed Boat" and track != "Deep Water Route":
-            st.error("❌ Boats can only navigate the Deep Water Route!")
-        elif vehicle != "Speed Boat" and track == "Deep Water Route":
-            st.error("❌ Land vehicles will sink in Deep Water! Select the Boat.")
-        else:
-            # Initialize trip variables
-            st.session_state.game_active = True
-            st.session_state.vehicle = vehicle
-            st.session_state.track = track
-            st.session_state.difficulty = difficulty
-            st.session_state.progress = 0  # 0 to 100%
-            st.session_state.speed = 0
-            st.session_state.gear = "N"
-            st.session_state.logs = ["Engine started. Safe travels!"]
-            st.rerun()
-    st.stop()
+    # Spacebar for Emergency Hard Hand-Brake
+    if held_keys['space']:
+        if speed > 0: speed = max(0, speed - 40 * time.dt)
+        if speed < 0: speed = min(0, speed + 40 * time.dt)
 
-# --- ACTIVE SIMULATOR INTERFACE ---
-st.header(f"Driving: {st.session_state.vehicle} on {st.session_state.track}")
-st.caption(f"Risk Setting: {st.session_state.difficulty}")
+    # Steering turning angles
+    if held_keys['a'] or held_keys['left arrow']:
+        player_vehicle.rotation_y -= 60 * time.dt * (speed / max_speed)
+    if held_keys['d'] or held_keys['right arrow']:
+        player_vehicle.rotation_y += 60 * time.dt * (speed / max_speed)
 
-# Base metrics
-progress_bar = st.progress(st.session_state.progress / 100)
-st.write(f"**Trip Progress:** {st.session_state.progress}% Complete")
+    # Move vehicle forward based on its current rotation angle
+    player_vehicle.position += player_vehicle.forward * speed * time.dt
 
-# Columns for controls
-col_left, col_right = st.columns([1, 2])
+    # Simple Check Bounds / Rewards loop simulation
+    if player_vehicle.z > 200:
+        money += 50
+        player_vehicle.z = -200 # Loop map back around
+        ui_text.text = f'Vehicle: {v_meta["name"]} | Track: {current_track} | Money: ${money}\nControls: WASD/Arrows | SPACE to Brake | V to Change Vehicle | T to Change Terrain'
 
-with col_left:
-    st.markdown("### 🕹️ Cockpit Controls")
+# --- INPUT HANDLING ---
+def input(key):
+    global current_vehicle_idx, current_track
     
-    # Steering & Braking inputs
-    steering = st.slider("Steering Alignment", -10, 10, 0, help="Keep it centered around sharp curves!")
-    brake = st.checkbox("Apply Brake")
-    
-    # Gear configuration
-    gear_options = ["R", "N", "1", "2", "3", "4"] if st.session_state.vehicle != "Speed Boat" else ["R", "N", "Half Throttle", "Full Throttle"]
-    gear = st.selectbox("Gear Box", gear_options, index=1)
-
-with col_right:
-    st.markdown("### 🛣️ Windshield & Environment")
-    
-    # Process turn actions
-    if st.button("Advance 10% Progress ➡️"):
-        hazard = random.randint(1, 10)
-        risk_multiplier = 2 if st.session_state.difficulty == "Risky" else 1
+    # Switch Vehicles instantly via key 'v'
+    if key == 'v':
+        current_vehicle_idx = (current_vehicle_idx + 1) % len(vehicles_data)
+        v = vehicles_data[current_vehicle_idx]
+        player_vehicle.model = 'cube'
+        player_vehicle.color = v["color"]
+        player_vehicle.scale = v["scale"]
         
-        # Physics engine math emulation
-        if gear in ["N", "R"]:
-            current_speed = 0
-            st.session_state.logs.append("You are idling or reversing. No forward progress made.")
+    # Switch Tracks / Difficulty visually via key 't'
+    if key == 't':
+        if current_track == "Highway":
+            current_track = "Risky Hill Tracks"
+            ground.color = color.brown
+            generate_hills()
         else:
-            current_speed = random.randint(30, 50) if "1" in gear or "Half" in gear else random.randint(65, 90)
-            if brake:
-                current_speed = max(0, current_speed - 40)
-            
-            # Handle track specific hurdles
-            crash = False
-            if st.session_state.track == "Rocky Hill Tracks" and current_speed > 50 and steering == 0:
-                crash = True
-                fail_msg = "💥 Rolled over a sharp hill ledge due to excess speed without steering corrections!"
-            elif hazard > (8 - risk_multiplier):
-                # Hazard triggered
-                if abs(steering) < 4 and not brake:
-                    crash = True
-                    fail_msg = f"💥 Obstacle appeared! Failed to steer/brake in time on the {st.session_state.track}."
-            
-            if crash:
-                # Calculate Partial Payout
-                payout = 0.0
-                if st.session_state.progress >= 50:
-                    payout = 15.0 * risk_multiplier
-                    st.session_state.money += payout
-                    st.session_state.logs.append(f"Halfway benchmark cleared before crash! Received partial recovery payout: ${payout}")
-                
-                st.error(fail_msg)
-                st.session_state.game_active = False
-                save_player(st.session_state.player_name, st.session_state.money, st.session_state.miles)
-                if st.button("Return to Garage"):
-                    st.rerun()
-                st.stop()
-            else:
-                # Successful tick
-                st.session_state.progress += 10
-                st.session_state.miles += (current_speed / 10)
-                st.session_state.logs.append(f"Cruising safely at {current_speed} mph. Steering stable.")
-        
-        # Check Win Condition
-        if st.session_state.progress >= 100:
-            base_reward = 50.0
-            total_payout = base_reward * risk_multiplier
-            st.session_state.money += total_payout
-            save_player(st.session_state.player_name, st.session_state.money, st.session_state.miles)
-            
-            st.balloons()
-            st.success(f"🎉 Destination reached safely! You earned a full payout of ${total_payout}!")
-            st.session_state.game_active = False
-            if st.button("Claim Rewards & Leave"):
-                st.rerun()
-            st.stop()
-            
-        st.rerun()
+            current_track = "Highway"
+            ground.color = color.green
+            # Remove objects for flat clear highway
+            for h in hills: destroy(h)
+            hills.clear()
 
-# Log display console
-st.text_area("Radio & Telemetry Logs", value="\n".join(st.session_state.logs[-4:]), height=120)
-
-if st.button("Abandon Run 🚨"):
-    st.session_state.game_active = False
-    st.rerun()
+app.run()
