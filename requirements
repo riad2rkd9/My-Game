@@ -1,1 +1,1 @@
-python snake_game.py
+streamlit==1.28.0
